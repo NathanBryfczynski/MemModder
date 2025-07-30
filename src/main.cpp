@@ -4,6 +4,7 @@
 #include <string>
 #include <sstream>
 #include <psapi.h>
+#include <variant>
 
 bool isReadable(DWORD protect) {
     return (protect & PAGE_READONLY) ||
@@ -18,6 +19,7 @@ enum class Command {
     SHOW,
     WRITE,
     SCAN,
+    HELP,
     INVALID
 };
 
@@ -30,15 +32,72 @@ Command stringToCommand(const std::string& input) {
     if (input == "exit") return Command::EXIT;
     if (input == "new") return Command::NEW;
     if (input == "show") return Command::SHOW;
-    if (input == "write") return Command::WRITE;
-    
-    // Check if input is a number
-    try {
-        (void)std::stoi(input); // Suppress unused variable warning
-        return Command::SCAN;
-    } catch (...) {
-        return Command::INVALID;
+    if (input.rfind("write ", 0) == 0) return Command::WRITE;
+    if (input == "help") return Command::HELP;
+    if (input.rfind("scan ", 0) == 0) return Command::SCAN;
+    return Command::INVALID;
+}
+
+std::vector<std::string> split(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::stringstream ss(str);
+    std::string token;
+    while (std::getline(ss, token, delimiter)) {
+        tokens.push_back(token);
     }
+    return tokens;
+}
+
+bool parseScanCommand(const std::string& input, std::string& type, std::variant<int, float>& value) {
+    auto tokens = split(input, ' ');
+    if (tokens.size() < 3) return false;
+    
+    if (tokens[0] != "scan") return false;
+    if (tokens[1] != "int" && tokens[1] != "float") return false;
+    
+    type = tokens[1];
+    
+    try {
+        if (type == "int") {
+            value = std::stoi(tokens[2]);
+            return true;
+        } else if (type == "float") {
+            value = std::stof(tokens[2]);
+            return true;
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+    
+    return false;
+}
+
+bool parseWriteCommand(const std::string& input, std::string& type, uintptr_t& address, std::variant<int, float>& value) {
+    auto tokens = split(input, ' ');
+    if (tokens.size() < 4) return false;
+    
+    if (tokens[0] != "write") return false;
+    if (tokens[1] != "int" && tokens[1] != "float") return false;
+    
+    type = tokens[1];
+    
+    try {
+        // Parse address (hex format)
+        address = std::stoull(tokens[2], nullptr, 16);
+        
+        // Parse value
+        if (type == "int") {
+            value = std::stoi(tokens[3]);
+            return true;
+        } else if (type == "float") {
+            value = std::stof(tokens[3]);
+            return true;
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+    
+    return false;
 }
 
 std::vector<Process> listProcesses() {
@@ -83,23 +142,25 @@ HANDLE getProcessHandle() {
     HANDLE hProcess;
 
     while (true) {
-        std::cout << "Enter PID of process to scan: ";
+        std::cout << "\nEnter PID of process to scan: ";
         std::cin >> pid;
         std::cin.ignore();
 
         hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION, FALSE, pid);
         if (!hProcess) {
             std::cerr << "Failed to open process." << std::endl;
+            std::cin.ignore();
             continue;
         }
-        std::cout << "Process opened successfully." << std::endl;
+            
+        system("cls");
         break;
     }
     return hProcess;
 }
 
 // Scans memory for addresses that contain specified value
-std::vector<uintptr_t> scanMemoryForInt(HANDLE hProcess, int value) {
+std::vector<uintptr_t> scanMemory(HANDLE hProcess, std::variant<int, float> value) {
     std::vector<uintptr_t> foundAddresses;
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
@@ -111,11 +172,21 @@ std::vector<uintptr_t> scanMemoryForInt(HANDLE hProcess, int value) {
                 std::vector<char> buffer(mbi.RegionSize);
                 SIZE_T bytesRead;
                 if (ReadProcessMemory(hProcess, mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytesRead)) {
-                    for (size_t i = 0; i + sizeof(int) <= bytesRead; ++i) {
-                        int* p = reinterpret_cast<int*>(&buffer[i]);
-                        if (*p == value) {
+                    if (std::holds_alternative<int>(value)) {
+                        for (size_t i = 0; i + sizeof(int) <= bytesRead; ++i) {
+                            int* p = reinterpret_cast<int*>(&buffer[i]);
+                            if (*p == std::get<int>(value)) {
                             uintptr_t foundAddr = (uintptr_t)mbi.BaseAddress + i;
                             foundAddresses.push_back(foundAddr);
+                            }
+                        }
+                    } else if (std::holds_alternative<float>(value)) {
+                        for (size_t i = 0; i + sizeof(float) <= bytesRead; ++i) {
+                            float* p = reinterpret_cast<float*>(&buffer[i]);
+                            if (*p == std::get<float>(value)) {
+                                uintptr_t foundAddr = (uintptr_t)mbi.BaseAddress + i;
+                                foundAddresses.push_back(foundAddr);
+                            }
                         }
                     }
                 }
@@ -129,14 +200,23 @@ std::vector<uintptr_t> scanMemoryForInt(HANDLE hProcess, int value) {
 }
 
 // Filters addresses to only include those that contain specified value
-std::vector<uintptr_t> filterAddressesByIntValue(HANDLE hProcess, const std::vector<uintptr_t>& addresses, int value) {
+std::vector<uintptr_t> filterAddressesByValue(HANDLE hProcess, const std::vector<uintptr_t>& addresses, std::variant<int, float> value) {
     std::vector<uintptr_t> newAddresses;
     for (auto address : addresses) {
-        int memValue = 0;
         SIZE_T bytesRead = 0;
-        if (ReadProcessMemory(hProcess, (LPCVOID)address, &memValue, sizeof(int), &bytesRead)) {
-            if (bytesRead == sizeof(int) && memValue == value) {
+        if (std::holds_alternative<int>(value)) {
+            int memValue = 0;
+            if (ReadProcessMemory(hProcess, (LPCVOID)address, &memValue, sizeof(int), &bytesRead)) {
+                if (bytesRead == sizeof(int) && memValue == std::get<int>(value)) {
                 newAddresses.push_back(address);
+                }
+            }
+        } else if (std::holds_alternative<float>(value)) {
+            float memValue = 0;
+            if (ReadProcessMemory(hProcess, (LPCVOID)address, &memValue, sizeof(float), &bytesRead)) {
+                if (bytesRead == sizeof(float) && memValue == std::get<float>(value)) {
+                    newAddresses.push_back(address);
+                }
             }
         }
     }
@@ -144,9 +224,25 @@ std::vector<uintptr_t> filterAddressesByIntValue(HANDLE hProcess, const std::vec
 }
 
 // Writes a value to an address
-bool writeIntToAddress(HANDLE hProcess, uintptr_t address, int newValue) {
+bool writeToAddress(HANDLE hProcess, uintptr_t address, std::variant<int, float> newValue) {
     SIZE_T bytesWritten = 0;
-    return WriteProcessMemory(hProcess, (LPVOID)address, &newValue, sizeof(int), &bytesWritten) && bytesWritten == sizeof(int);
+    if (std::holds_alternative<int>(newValue)) {
+        return WriteProcessMemory(hProcess, (LPVOID)address, &std::get<int>(newValue), sizeof(int), &bytesWritten) && bytesWritten == sizeof(int);
+    } else if (std::holds_alternative<float>(newValue)) {
+        return WriteProcessMemory(hProcess, (LPVOID)address, &std::get<float>(newValue), sizeof(float), &bytesWritten) && bytesWritten == sizeof(float);
+    }
+    return false;
+}
+
+void printHelp() {
+
+    std::cout << "\nAvailable commands:\n"
+              << "  scan <type> <value>             - Search for values in memory\n"
+              << "  show                            - Display found addresses\n"
+              << "  write <type> <address> <value>  - Write value to address\n"
+              << "  new                             - Start a new scan\n"
+              << "  help                            - Show this help message\n"
+              << "  exit                            - Exit program\n";
 }
 
 int main() {
@@ -162,8 +258,10 @@ int main() {
     bool firstScan = true;
     std::string input;
 
+    printHelp();
+
     while (true) {
-        std::cout << "\nEnter value to scan for (or 'show'/'write'/'new'/'exit'): ";
+        std::cout << "\n> ";
         std::getline(std::cin, input);
 
         switch (stringToCommand(input)) {
@@ -183,49 +281,71 @@ int main() {
                 break;
             }
             case Command::WRITE: {
-                std::string addrInput, valueInput;
-                std::cout << "Enter address to overwrite (hex, e.g. 0x1234abcd): ";
-                std::getline(std::cin, addrInput);
-                uintptr_t address = 0;
-                std::istringstream addrStream(addrInput);
-                addrStream >> std::hex >> address;
-                if (!address) {
-                    std::cout << "Invalid address." << std::endl;
+                std::string type;
+                uintptr_t address;
+                std::variant<int, float> value;
+                
+                if (!parseWriteCommand(input, type, address, value)) {
+                    std::cout << "Usage: write <type> <address> <value>" << std::endl;
                     break;
                 }
-                std::cout << "Enter new integer value: ";
-                std::getline(std::cin, valueInput);
-                int newValue = 0;
-                std::istringstream valueStream(valueInput);
-                if (!(valueStream >> newValue)) {
-                    std::cout << "Invalid value." << std::endl;
-                    break;
-                }
-                if (writeIntToAddress(hProcess, address, newValue)) {
-                    std::cout << "Successfully wrote value " << newValue << " to address 0x" << std::hex << address << std::dec << std::endl;
+
+                if (type == "int") {
+                    if (writeToAddress(hProcess, address, value)) {
+                        std::cout << "Successfully wrote value " << std::get<int>(value) << " to address 0x" << std::hex << address << std::dec << std::endl;
+                    } else {
+                        std::cout << "Failed to write value. (Try running as administrator or check permissions)" << std::endl;
+                    }
+                } else if (type == "float") {
+                    if (writeToAddress(hProcess, address, value)) {
+                        std::cout << "Successfully wrote value " << std::get<float>(value) << " to address 0x" << std::hex << address << std::dec << std::endl;
+                    } else {
+                        std::cout << "Failed to write value. (Try running as administrator or check permissions)" << std::endl;
+                    }
                 } else {
-                    std::cout << "Failed to write value. (Try running as administrator or check permissions)" << std::endl;
+                    std::cout << "Invalid type. Type 'help' for available commands." << std::endl;
                 }
+
                 break;
             }
 
             case Command::SCAN: {
-                int value;
-                std::istringstream iss(input);
-                iss >> value; // We already know it's a number from stringToCommand
+                std::string type;
+                std::variant<int, float> value;
                 
-                if (firstScan) {
-                    foundAddresses = scanMemoryForInt(hProcess, value);
-                    firstScan = false;
-                } else {
-                    foundAddresses = filterAddressesByIntValue(hProcess, foundAddresses, value);
+                if (!parseScanCommand(input, type, value)) {
+                    std::cout << "Usage: scan int <value> or scan float <value>" << std::endl;
+                    break;
                 }
-                std::cout << "Found " << foundAddresses.size() << " matching addresses." << std::endl;
+                
+                if (type == "int") {
+                    if (firstScan) {
+                        foundAddresses = scanMemory(hProcess, std::get<int>(value));
+                        firstScan = false;
+                    } else {
+                        foundAddresses = filterAddressesByValue(hProcess, foundAddresses, std::get<int>(value));
+                    }
+                    std::cout << "Found " << foundAddresses.size() << " matching addresses." << std::endl;
+                } else if (type == "float") {
+                    if (firstScan) {
+                        foundAddresses = scanMemory(hProcess, std::get<float>(value));
+                        firstScan = false;
+                    } else {
+                        foundAddresses = filterAddressesByValue(hProcess, foundAddresses, std::get<float>(value));
+                    }
+                    std::cout << "Found " << foundAddresses.size() << " matching addresses." << std::endl;
+                } else {
+                    std::cout << "Only 'int' and 'float' types are supported currently." << std::endl;
+                }
                 break;
             }
 
+            case Command::HELP:
+                printHelp();
+                break;
+
             case Command::INVALID:
-                std::cout << "Invalid command." << std::endl;
+                std::cout << "Invalid command. Type 'help' for available commands." << std::endl;
                 break;
         }
     }
